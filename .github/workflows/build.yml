@@ -1,0 +1,127 @@
+name: build multi nydus
+
+on:
+  workflow_dispatch:
+
+jobs:
+  get_latest_10_releases:
+    name: Get tags
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.get-tags.outputs.tags }}
+    steps:
+      - name: Fetch latest 10 tags
+        id: get-tags
+        run: |
+          TAGS=$(curl -s "https://api.github.com/repos/dragonflyoss/nydus/releases?per_page=15" | \
+            jq -r '.[].tag_name' | sort -u | head -n 10 | jq -R -s -c 'split("\n")[:-1]')
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+
+  nydus-linux:
+    name: Build nydus ${{ matrix.tag }} for ${{ matrix.arch }}
+    needs: [get_latest_10_releases]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tag: ${{ fromJson(needs.get_latest_10_releases.outputs.tags) }}
+        arch: [loong64]
+    env:
+      repo: 'dragonflyoss/nydus'
+    steps:
+      - name: Checkout Current Repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Clone Target Repo
+        run: |
+          git clone --depth 1 -b ${{ matrix.tag }} https://github.com/${{ env.repo }} target
+          cp -r target/* . && rm -f rust-toolchain && cargo update
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: ${{ runner.os }}-cargo-${{ matrix.arch }}
+
+      - name: Build nydus
+        run: |
+          cargo update
+          declare -A rust_target_map=( ["amd64"]="x86_64-unknown-linux-musl" ["loong64"]="loongarch64-unknown-linux-gnu" )
+          RUST_TARGET=${rust_target_map[${{ matrix.arch }}]}
+          rustup target add "$RUST_TARGET"
+          make -e RUST_TARGET_STATIC=$RUST_TARGET static-release
+          mv target/$RUST_TARGET/release/nydusd .
+          mv target/$RUST_TARGET/release/nydus-image .
+          mv target/$RUST_TARGET/release/nydusctl .
+          cp -r misc/configs .
+
+      - name: Store artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nydus-artifacts-linux-${{ matrix.tag }}-${{ matrix.arch }}
+          path: |
+            nydusd
+            nydus-image
+            nydusctl
+            configs
+
+  prepare-tarball-linux:
+    needs: [nydus-linux]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [loong64]
+        tag: ${{ fromJson(needs.get_latest_10_releases.outputs.tags) }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nydus-artifacts-linux-${{ matrix.tag }}-${{ matrix.arch }}*
+          merge-multiple: true
+          path: nydus-static
+
+      - name: Prepare tarball
+        run: |
+          tarball="nydus-static-${{ matrix.tag }}-linux-${{ matrix.arch }}.tgz"
+          chmod +x nydus-static/*
+          tar cf - nydus-static | gzip > ${tarball}
+          echo "tarball=${tarball}" >> $GITHUB_ENV
+
+          shasum="${tarball}.sha256sum"
+          sha256sum ${tarball} > $shasum
+          echo "tarball_shasum=${shasum}" >> $GITHUB_ENV
+
+      - name: Store release tarballs
+        uses: actions/upload-artifact@v4
+        with:
+          name: nydus-release-tarball-${{ matrix.tag }}-${{ matrix.arch }}
+          path: |
+            ${{ env.tarball }}
+            ${{ env.tarball_shasum }}
+
+  create-release:
+    name: Create GitHub Release
+    needs: [prepare-tarball-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nydus-release-tarball-*
+          merge-multiple: true
+          path: release-tarballs
+
+      - name: Create GitHub Release for each tag
+        run: |
+          for tar in release-tarballs/nydus-static-*-linux-*.tgz; do
+            tag=$(echo "$tar" | grep -oP 'nydus-static-\K.*(?=-linux)')
+            echo "Releasing tag: $tag"
+            gh release create "$tag" "$tar" "${tar}.sha256sum" \
+              --title "Nydus Image Service $tag" \
+              --notes "Auto-generated release for $tag"
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
